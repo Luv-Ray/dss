@@ -227,27 +227,46 @@ impl Raft {
         let peer_clone = peer.clone();
         peer.spawn(async move {
             let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
-            let _ = tx.send(res);
+            tx.send(res).expect("Can't send");
         });
         rx
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
+        if !matches!(self.role_state, RoleState::Leader { .. }) {
+            return Err(Error::NotLeader);
+        }
+
+        let index = self.persistent_state.log.len() as u64;
+        let term = self.persistent_state.current_term;
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         // Your code here (2B).
+        self.persistent_state.log.push((term, Entry { data: buf }));
 
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
+        for (peer, clinet) in self.peers.iter().enumerate() {
+            if peer == self.me {
+                continue;
+            }
+
+            let args = self.append_entries_args(peer, false);
+            let fut = clinet.append_entries(&args);
+            let tx = self.event_loop_tx.clone().unwrap();
+
+            self.executor
+                .spawn(async move {
+                    if let Ok(append_entries_reply) = fut.await {
+                        tx.unbounded_send(Event::AppendEntriesReply(peer, append_entries_reply))
+                            .expect("Can't send");
+                    }
+                })
+                .expect("Can't spawn");
         }
+
+        Ok((index, term))
     }
 
     fn cond_install_snapshot(
@@ -266,7 +285,7 @@ impl Raft {
     }
 }
 
-// trans role
+// translate status
 impl Raft {
     fn trans_to_follower(&mut self) {
         self.role_state = RoleState::Follower;
@@ -274,13 +293,15 @@ impl Raft {
 
     fn trans_to_candidate(&mut self) {
         self.role_state = RoleState::Candidate { get_vote: 1 };
+        self.persistent_state.voted_for = Some(self.me);
     }
 
     fn trans_to_leader(&mut self) {
         self.role_state = RoleState::Leader {
-            next_index: vec![self.persistent_state.log.len() + 1, self.peers.len()],
-            match_index: vec![0, self.peers.len()],
+            next_index: vec![self.persistent_state.log.len(); self.peers.len()],
+            match_index: vec![0; self.peers.len()],
         };
+        self.handle_heart_beat();
     }
 
     fn trans_term(&mut self, term: u64) {
@@ -289,13 +310,44 @@ impl Raft {
     }
 }
 
+// args
 impl Raft {
-    fn append_entries_args(&self, entries: Vec<Entry>) -> AppendEntriesArgs {
+    fn append_entries_args(&self, peer: usize, is_heart_beat: bool) -> AppendEntriesArgs {
+        // prev_log_index
+        let index = if is_heart_beat {
+            0
+        } else {
+            match &self.role_state {
+                RoleState::Leader { next_index, .. } => next_index[peer] - 1,
+                _ => unreachable!(),
+            }
+        };
+
+        // prev_log_term
+        let prev_log_term = if is_heart_beat {
+            0
+        } else {
+            self.persistent_state.log[index].0
+        };
+
+        // entries
+        let entries = if is_heart_beat {
+            Vec::new()
+        } else if index + 2 <= self.persistent_state.log.len() {
+            Vec::new()
+        } else {
+            self.persistent_state.log[index..]
+                .to_vec()
+                .into_iter()
+                .map(|(_, entry)| entry)
+                .collect()
+        };
+
         AppendEntriesArgs {
             term: self.persistent_state.current_term,
             leader_id: self.me as u64,
-            prev_log_index: self.persistent_state.log.len() as u64,
-            prev_log_term: self.persistent_state.log.last().unwrap().0,
+            prev_log_index: index as u64,
+            prev_log_term,
             entries,
             leader_commit: self.volatile_state.commit_index as u64,
         }
@@ -327,12 +379,14 @@ impl Raft {
         }
     }
 
+    // Candidate and Follower: begin election
     fn handle_timeout(&mut self) {
         match self.role_state {
             RoleState::Candidate { .. } | RoleState::Follower => {
                 self.trans_term(self.persistent_state.current_term + 1);
                 self.trans_to_candidate();
 
+                // println!("CANDIDATE: PEERS {}", self.peers.len());
                 for (peer, client) in self.peers.iter().enumerate() {
                     if peer == self.me {
                         continue;
@@ -359,15 +413,17 @@ impl Raft {
         }
     }
 
-    fn handle_heart_beat(&mut self) {
+    // Leader: send heart beat
+    fn handle_heart_beat(&self) {
         match &self.role_state {
             RoleState::Leader { .. } => {
+                // println!("HEART BEAT: PEERS {}", self.peers.len());
                 for (peer, clinet) in self.peers.iter().enumerate() {
                     if peer == self.me {
                         continue;
                     }
 
-                    let args = self.append_entries_args(Vec::new());
+                    let args = self.append_entries_args(peer, true);
                     let fut = clinet.append_entries(&args);
                     let tx = self.event_loop_tx.clone().unwrap();
 
@@ -388,22 +444,33 @@ impl Raft {
         }
     }
 
+    // All: vote
     fn handle_request_vote(&mut self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        if args.term > self.persistent_state.current_term {
-            self.trans_term(args.term);
+        let RequestVoteArgs {
+            term,
+            candidate_id,
+            last_log_index,
+            last_log_term,
+        } = args;
+
+        if term > self.persistent_state.current_term {
+            self.trans_term(term);
             self.trans_to_follower();
         }
 
         let vote_granted = {
-            if args.term < self.persistent_state.current_term {
+            if term < self.persistent_state.current_term {
                 false
             } else if self.persistent_state.voted_for.is_some()
-                && self.persistent_state.voted_for.unwrap() as u64 != args.candidate_id
+                && self.persistent_state.voted_for.unwrap() as u64 != candidate_id
+            {
+                false
+            } else if last_log_index < self.persistent_state.log.len() as u64
+                || last_log_term < self.persistent_state.log.last().unwrap().0
             {
                 false
             } else {
-                // TODO
-                self.persistent_state.voted_for = Some(args.candidate_id as usize);
+                self.persistent_state.voted_for = Some(candidate_id as usize);
                 true
             }
         };
@@ -414,13 +481,25 @@ impl Raft {
         })
     }
 
-    fn handle_request_vote_reply(&mut self, _from: usize, request_vote_reply: RequestVoteReply) {
+    // Candidate: handle vote reply
+    fn handle_request_vote_reply(&mut self, _from: usize, reply: RequestVoteReply) {
+        let RequestVoteReply { term, vote_granted } = reply;
+
+        if term > self.persistent_state.current_term {
+            self.trans_term(term);
+            self.trans_to_follower();
+            return;
+        }
+
         match &mut self.role_state {
             RoleState::Candidate { get_vote } => {
-                if request_vote_reply.term > self.persistent_state.current_term {
-                    self.trans_term(request_vote_reply.term);
+                if term > self.persistent_state.current_term {
+                    self.trans_term(term);
                     self.trans_to_follower();
-                } else if request_vote_reply.vote_granted {
+                    return;
+                }
+
+                if vote_granted {
                     *get_vote += 1;
                     if *get_vote >= (self.peers.len() + 1) as u64 / 2 {
                         self.trans_to_leader();
@@ -431,33 +510,84 @@ impl Raft {
         }
     }
 
+    // Candidate: trans to Follower
+    // Follower: update log
     fn handle_append_entries(
         &mut self,
         args: AppendEntriesArgs,
     ) -> labrpc::Result<AppendEntriesReply> {
-        match &self.role_state {
-            RoleState::Follower => {
-                self.event_loop_tx
-                    .clone()
-                    .unwrap()
-                    .unbounded_send(Event::ResetTimeout)
-                    .expect("Can't send");
+        let AppendEntriesArgs {
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            mut entries,
+            leader_commit,
+        } = args;
+        let prev_log_index = prev_log_index as usize;
+        let leader_commit = leader_commit as usize;
+
+        if term > self.persistent_state.current_term {
+            self.trans_term(term);
+            self.trans_to_follower();
+        }
+
+        if term == self.persistent_state.current_term {
+            if matches!(self.role_state, RoleState::Candidate { .. }) {
+                self.trans_to_follower();
             }
-            _ => {}
+            self.event_loop_tx
+                .clone()
+                .unwrap()
+                .unbounded_send(Event::ResetTimeout)
+                .expect("Can't send");
         }
 
         let success = {
-            if args.term < self.persistent_state.current_term {
+            if term < self.persistent_state.current_term {
+                false
+            } else if self.persistent_state.log.len() <= prev_log_index
+                || self.persistent_state.log[prev_log_index].0 != prev_log_term
+            {
                 false
             } else {
-                // TODO
                 true
             }
         };
 
-        if args.term > self.persistent_state.current_term {
-            self.trans_term(args.term);
-            self.trans_to_follower();
+        if success {
+            // commit index
+            if leader_commit > self.volatile_state.commit_index {
+                self.volatile_state.commit_index =
+                    std::cmp::min(leader_commit, prev_log_index + entries.len());
+            }
+
+            // update log
+            let mut last_index = std::cmp::min(
+                entries.len(),
+                self.persistent_state.log.len() - (prev_log_index + 1),
+            );
+
+            for index in (prev_log_index + 1)..self.persistent_state.log.len() {
+                if self.persistent_state.log[index].0 != term {
+                    self.persistent_state.log.truncate(index);
+                    last_index = index - (prev_log_index + 1);
+                    break;
+                }
+            }
+
+            if last_index < entries.len() {
+                self.persistent_state.log.extend(
+                    entries
+                        .split_off(last_index)
+                        .into_iter()
+                        .map(|entry| (term, entry))
+                        .collect::<Vec<(u64, Entry)>>(),
+                );
+            }
+
+            // TODO
+            if leader_id == 0 {}
         }
 
         Ok(AppendEntriesReply {
@@ -466,29 +596,33 @@ impl Raft {
         })
     }
 
+    // Leader: handle append entries reply
     fn handle_append_entries_reply(
         &mut self,
         from: usize,
         append_entries_reply: AppendEntriesReply,
     ) {
+        let AppendEntriesReply { term, success } = append_entries_reply;
+
+        if term > self.persistent_state.current_term {
+            self.trans_to_follower();
+            return;
+        }
+
         match &mut self.role_state {
             RoleState::Leader {
                 next_index,
                 match_index,
             } => {
-                let AppendEntriesReply { term, success } = append_entries_reply;
-                if term > self.persistent_state.current_term {
-                    self.trans_to_follower();
-                    return;
-                }
-
-                if from >= next_index.len() {
-                    // TODO: WHY HAPPEN?
-                } else if success {
-                    next_index[from] += 1;
-                    match_index[from] = next_index[from];
-                } else {
-                    next_index[from] -= 1;
+                if next_index[from] < self.persistent_state.log.len() {
+                    if success {
+                        next_index[from] += 1;
+                        match_index[from] = next_index[from];
+                    } else {
+                        next_index[from] -= 1;
+                        let args = self.append_entries_args(from, false);
+                        self.peers[from].append_entries(&args);
+                    }
                 }
 
                 if term == self.persistent_state.current_term {}
