@@ -44,7 +44,7 @@ enum Event {
     Timeout,
     HeartBeat,
     RequestVoteReply(usize, RequestVoteReply),
-    AppendEntriesReply(usize, AppendEntriesReply),
+    AppendEntriesReply(usize, usize, AppendEntriesReply),
 }
 
 /// State of a raft peer.
@@ -96,7 +96,7 @@ impl PersistentState {
 #[derive(Default)]
 struct VolatileState {
     commit_index: usize,
-    _last_applied: usize,
+    last_applied: usize,
 }
 
 // A single Raft peer.
@@ -245,6 +245,7 @@ impl Raft {
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         // Your code here (2B).
+        // println!("Receive command: {:?}", buf);
         self.persistent_state.log.push((term, Entry { data: buf }));
 
         for (peer, clinet) in self.peers.iter().enumerate() {
@@ -252,15 +253,19 @@ impl Raft {
                 continue;
             }
 
-            let args = self.append_entries_args(peer, false);
+            let args = self.append_entries_args(peer);
             let fut = clinet.append_entries(&args);
             let tx = self.event_loop_tx.clone().unwrap();
 
             self.executor
                 .spawn(async move {
                     if let Ok(append_entries_reply) = fut.await {
-                        tx.unbounded_send(Event::AppendEntriesReply(peer, append_entries_reply))
-                            .expect("Can't send");
+                        tx.unbounded_send(Event::AppendEntriesReply(
+                            args.entries.len(),
+                            peer,
+                            append_entries_reply,
+                        ))
+                        .expect("Can't send");
                     }
                 })
                 .expect("Can't spawn");
@@ -297,11 +302,12 @@ impl Raft {
     }
 
     fn trans_to_leader(&mut self) {
+        println!("{}: Trans to Leader", self.me);
         self.role_state = RoleState::Leader {
             next_index: vec![self.persistent_state.log.len(); self.peers.len()],
             match_index: vec![0; self.peers.len()],
         };
-        self.handle_heart_beat();
+        self.send_heart_beat();
     }
 
     fn trans_term(&mut self, term: u64) {
@@ -312,11 +318,9 @@ impl Raft {
 
 // args
 impl Raft {
-    fn append_entries_args(&self, peer: usize, is_heart_beat: bool) -> AppendEntriesArgs {
+    fn append_entries_args(&self, peer: usize) -> AppendEntriesArgs {
         // prev_log_index
-        let index = if is_heart_beat {
-            0
-        } else {
+        let index = {
             match &self.role_state {
                 RoleState::Leader { next_index, .. } => next_index[peer] - 1,
                 _ => unreachable!(),
@@ -324,19 +328,13 @@ impl Raft {
         };
 
         // prev_log_term
-        let prev_log_term = if is_heart_beat {
-            0
-        } else {
-            self.persistent_state.log[index].0
-        };
+        let prev_log_term = self.persistent_state.log[index].0;
 
         // entries
-        let entries = if is_heart_beat {
-            Vec::new()
-        } else if index + 2 <= self.persistent_state.log.len() {
+        let entries = if index + 1 >= self.persistent_state.log.len() {
             Vec::new()
         } else {
-            self.persistent_state.log[index..]
+            self.persistent_state.log[(index + 1)..]
                 .to_vec()
                 .into_iter()
                 .map(|(_, entry)| entry)
@@ -369,12 +367,12 @@ impl Raft {
         match event {
             Event::ResetTimeout => unreachable!(),
             Event::Timeout => self.handle_timeout(),
-            Event::HeartBeat => self.handle_heart_beat(),
+            Event::HeartBeat => self.send_heart_beat(),
             Event::RequestVoteReply(from, request_vote_reply) => {
                 self.handle_request_vote_reply(from, request_vote_reply)
             }
-            Event::AppendEntriesReply(from, append_entries_reply) => {
-                self.handle_append_entries_reply(from, append_entries_reply)
+            Event::AppendEntriesReply(len, from, append_entries_reply) => {
+                self.handle_append_entries_reply(len, from, append_entries_reply)
             }
         }
     }
@@ -386,7 +384,7 @@ impl Raft {
                 self.trans_term(self.persistent_state.current_term + 1);
                 self.trans_to_candidate();
 
-                // println!("CANDIDATE: PEERS {}", self.peers.len());
+                // // println!("CANDIDATE: PEERS {}", self.peers.len());
                 for (peer, client) in self.peers.iter().enumerate() {
                     if peer == self.me {
                         continue;
@@ -414,16 +412,16 @@ impl Raft {
     }
 
     // Leader: send heart beat
-    fn handle_heart_beat(&self) {
+    fn send_heart_beat(&self) {
         match &self.role_state {
             RoleState::Leader { .. } => {
-                // println!("HEART BEAT: PEERS {}", self.peers.len());
+                // println!("{}: Send Heart Beat", self.me);
                 for (peer, clinet) in self.peers.iter().enumerate() {
                     if peer == self.me {
                         continue;
                     }
 
-                    let args = self.append_entries_args(peer, true);
+                    let args = self.append_entries_args(peer);
                     let fut = clinet.append_entries(&args);
                     let tx = self.event_loop_tx.clone().unwrap();
 
@@ -431,6 +429,7 @@ impl Raft {
                         .spawn(async move {
                             if let Ok(append_entries_reply) = fut.await {
                                 tx.unbounded_send(Event::AppendEntriesReply(
+                                    args.entries.len(),
                                     peer,
                                     append_entries_reply,
                                 ))
@@ -516,6 +515,8 @@ impl Raft {
         &mut self,
         args: AppendEntriesArgs,
     ) -> labrpc::Result<AppendEntriesReply> {
+        // println!("{}: Receive Append Entries", self.me);
+
         let AppendEntriesArgs {
             term,
             leader_id,
@@ -526,6 +527,7 @@ impl Raft {
         } = args;
         let prev_log_index = prev_log_index as usize;
         let leader_commit = leader_commit as usize;
+        // println!("{}: receive entry {:?}", self.me, entries);
 
         if term > self.persistent_state.current_term {
             self.trans_term(term);
@@ -556,14 +558,8 @@ impl Raft {
         };
 
         if success {
-            // commit index
-            if leader_commit > self.volatile_state.commit_index {
-                self.volatile_state.commit_index =
-                    std::cmp::min(leader_commit, prev_log_index + entries.len());
-            }
-
             // update log
-            let mut last_index = std::cmp::min(
+            let mut begin_append_len = std::cmp::min(
                 entries.len(),
                 self.persistent_state.log.len() - (prev_log_index + 1),
             );
@@ -571,19 +567,27 @@ impl Raft {
             for index in (prev_log_index + 1)..self.persistent_state.log.len() {
                 if self.persistent_state.log[index].0 != term {
                     self.persistent_state.log.truncate(index);
-                    last_index = index - (prev_log_index + 1);
+                    begin_append_len = index - (prev_log_index + 1);
                     break;
                 }
             }
 
-            if last_index < entries.len() {
+            if begin_append_len < entries.len() {
                 self.persistent_state.log.extend(
                     entries
-                        .split_off(last_index)
+                        .split_off(begin_append_len)
                         .into_iter()
                         .map(|entry| (term, entry))
                         .collect::<Vec<(u64, Entry)>>(),
                 );
+            }
+
+            // commit index
+            if leader_commit > self.volatile_state.commit_index {
+                self.volatile_state.commit_index =
+                    std::cmp::min(leader_commit, prev_log_index + entries.len());
+
+                self.update_apply();
             }
 
             // TODO
@@ -599,6 +603,7 @@ impl Raft {
     // Leader: handle append entries reply
     fn handle_append_entries_reply(
         &mut self,
+        len: usize,
         from: usize,
         append_entries_reply: AppendEntriesReply,
     ) {
@@ -609,26 +614,79 @@ impl Raft {
             return;
         }
 
+        // change next and match index
         match &mut self.role_state {
             RoleState::Leader {
                 next_index,
                 match_index,
             } => {
+                let success_index = next_index[from];
                 if next_index[from] < self.persistent_state.log.len() {
                     if success {
-                        next_index[from] += 1;
-                        match_index[from] = next_index[from];
+                        next_index[from] += len;
+                        match_index[from] = success_index;
                     } else {
                         next_index[from] -= 1;
-                        let args = self.append_entries_args(from, false);
+                        let args = self.append_entries_args(from);
                         self.peers[from].append_entries(&args);
                     }
                 }
-
-                if term == self.persistent_state.current_term {}
             }
             _ => {}
         }
+
+        // commit
+        match &self.role_state {
+            RoleState::Leader {
+                next_index,
+                match_index,
+            } => {
+                let success_index = next_index[from] - 1;
+                if success
+                    && term == self.persistent_state.current_term
+                    && success_index > self.volatile_state.commit_index
+                {
+                    let mut sum = 1;
+                    for i in 0..self.peers.len() {
+                        if i == self.me {
+                            continue;
+                        }
+                        if match_index[i] >= success_index {
+                            sum += 1;
+                        }
+                    }
+
+                    if sum >= (self.peers.len() + 1) / 2 {
+                        self.volatile_state.commit_index = success_index;
+                        self.update_apply();
+                        self.send_heart_beat();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Raft {
+    fn update_apply(&mut self) {
+        let begin = self.volatile_state.last_applied + 1;
+        let end = self.volatile_state.commit_index;
+
+        for index in begin..=end {
+            // println!(
+            //     "{}: Commit {} Data {:?}",
+            //     self.me, index, self.persistent_state.log[index].1.data
+            // );
+            self.apply_ch
+                .unbounded_send(ApplyMsg::Command {
+                    data: self.persistent_state.log[index].1.data.clone(),
+                    index: index as u64,
+                })
+                .expect("Can't send");
+        }
+
+        self.volatile_state.last_applied = end;
     }
 }
 
