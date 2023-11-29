@@ -256,12 +256,13 @@ impl Raft {
             let args = self.append_entries_args(peer);
             let fut = clinet.append_entries(&args);
             let tx = self.event_loop_tx.clone().unwrap();
+            let log_len = self.persistent_state.log.len();
 
             self.executor
                 .spawn(async move {
                     if let Ok(append_entries_reply) = fut.await {
                         tx.unbounded_send(Event::AppendEntriesReply(
-                            args.entries.len(),
+                            log_len,
                             peer,
                             append_entries_reply,
                         ))
@@ -302,7 +303,7 @@ impl Raft {
     }
 
     fn trans_to_leader(&mut self) {
-        println!("{}: Trans to Leader", self.me);
+        // println!("{}: Trans to Leader", self.me);
         self.role_state = RoleState::Leader {
             next_index: vec![self.persistent_state.log.len(); self.peers.len()],
             match_index: vec![0; self.peers.len()],
@@ -458,14 +459,20 @@ impl Raft {
         }
 
         let vote_granted = {
+            // term
             if term < self.persistent_state.current_term {
                 false
-            } else if self.persistent_state.voted_for.is_some()
+            }
+            // voted_for
+            else if self.persistent_state.voted_for.is_some()
                 && self.persistent_state.voted_for.unwrap() as u64 != candidate_id
             {
                 false
-            } else if last_log_index < self.persistent_state.log.len() as u64
-                || last_log_term < self.persistent_state.log.last().unwrap().0
+            }
+            // log is up-to-date(section 5.4.1)
+            else if last_log_term < self.persistent_state.log.last().unwrap().0
+                || (last_log_term == self.persistent_state.log.last().unwrap().0
+                    && last_log_index < self.persistent_state.log.len() as u64)
             {
                 false
             } else {
@@ -522,7 +529,7 @@ impl Raft {
             leader_id,
             prev_log_index,
             prev_log_term,
-            mut entries,
+            entries,
             leader_commit,
         } = args;
         let prev_log_index = prev_log_index as usize;
@@ -558,40 +565,27 @@ impl Raft {
         };
 
         if success {
+            let sync_index = prev_log_index + entries.len();
+
             // update log
-            let mut begin_append_len = std::cmp::min(
-                entries.len(),
-                self.persistent_state.log.len() - (prev_log_index + 1),
-            );
-
-            for index in (prev_log_index + 1)..self.persistent_state.log.len() {
-                if self.persistent_state.log[index].0 != term {
+            for (index, entry) in entries.into_iter().enumerate() {
+                let index = prev_log_index + index + 1;
+                if index >= self.persistent_state.log.len() {
+                    self.persistent_state.log.push((term, entry));
+                } else if self.persistent_state.log[index] != (term, entry.clone()) {
                     self.persistent_state.log.truncate(index);
-                    begin_append_len = index - (prev_log_index + 1);
-                    break;
+                    self.persistent_state.log.push((term, entry));
                 }
-            }
-
-            if begin_append_len < entries.len() {
-                self.persistent_state.log.extend(
-                    entries
-                        .split_off(begin_append_len)
-                        .into_iter()
-                        .map(|entry| (term, entry))
-                        .collect::<Vec<(u64, Entry)>>(),
-                );
             }
 
             // commit index
             if leader_commit > self.volatile_state.commit_index {
-                self.volatile_state.commit_index =
-                    std::cmp::min(leader_commit, prev_log_index + entries.len());
-
+                self.volatile_state.commit_index = leader_commit.min(sync_index);
                 self.update_apply();
             }
 
             // TODO
-            if leader_id == 0 {}
+            let _ = leader_id;
         }
 
         Ok(AppendEntriesReply {
@@ -623,7 +617,7 @@ impl Raft {
                 let success_index = next_index[from];
                 if next_index[from] < self.persistent_state.log.len() {
                     if success {
-                        next_index[from] += len;
+                        next_index[from] = next_index[from].max(len);
                         match_index[from] = success_index;
                     } else {
                         next_index[from] -= 1;
@@ -761,7 +755,7 @@ impl Node {
             .spawn(async move {
                 let election_builder = || {
                     futures_timer::Delay::new(Duration::from_millis(
-                        rand::thread_rng().gen_range(250, 500),
+                        rand::thread_rng().gen_range(150, 300),
                     ))
                     .fuse()
                 };
