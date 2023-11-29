@@ -80,7 +80,7 @@ enum RoleState {
 struct PersistentState {
     current_term: u64,
     voted_for: Option<usize>,
-    log: Vec<(u64, Entry)>,
+    log: Vec<Entry>,
 }
 
 impl PersistentState {
@@ -246,7 +246,7 @@ impl Raft {
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         // Your code here (2B).
         // println!("Receive command: {:?}", buf);
-        self.persistent_state.log.push((term, Entry { data: buf }));
+        self.persistent_state.log.push(Entry { term, data: buf });
 
         for (peer, clinet) in self.peers.iter().enumerate() {
             if peer == self.me {
@@ -329,7 +329,7 @@ impl Raft {
         };
 
         // prev_log_term
-        let prev_log_term = self.persistent_state.log[index].0;
+        let prev_log_term = self.persistent_state.log[index].term;
 
         // entries
         let entries = if index + 1 >= self.persistent_state.log.len() {
@@ -338,7 +338,7 @@ impl Raft {
             self.persistent_state.log[(index + 1)..]
                 .to_vec()
                 .into_iter()
-                .map(|(_, entry)| entry)
+                // .map(|(_, entry)| entry)
                 .collect()
         };
 
@@ -357,7 +357,7 @@ impl Raft {
             term: self.persistent_state.current_term,
             candidate_id: self.me as u64,
             last_log_index: self.persistent_state.log.len() as u64,
-            last_log_term: self.persistent_state.log.last().unwrap().0,
+            last_log_term: self.persistent_state.log.last().unwrap().term,
         }
     }
 }
@@ -470,8 +470,8 @@ impl Raft {
                 false
             }
             // log is up-to-date(section 5.4.1)
-            else if last_log_term < self.persistent_state.log.last().unwrap().0
-                || (last_log_term == self.persistent_state.log.last().unwrap().0
+            else if last_log_term < self.persistent_state.log.last().unwrap().term
+                || (last_log_term == self.persistent_state.log.last().unwrap().term
                     && last_log_index < self.persistent_state.log.len() as u64)
             {
                 false
@@ -556,7 +556,7 @@ impl Raft {
             if term < self.persistent_state.current_term {
                 false
             } else if self.persistent_state.log.len() <= prev_log_index
-                || self.persistent_state.log[prev_log_index].0 != prev_log_term
+                || self.persistent_state.log[prev_log_index].term != prev_log_term
             {
                 false
             } else {
@@ -571,10 +571,10 @@ impl Raft {
             for (index, entry) in entries.into_iter().enumerate() {
                 let index = prev_log_index + index + 1;
                 if index >= self.persistent_state.log.len() {
-                    self.persistent_state.log.push((term, entry));
-                } else if self.persistent_state.log[index] != (term, entry.clone()) {
+                    self.persistent_state.log.push(entry);
+                } else if self.persistent_state.log[index] != entry.clone() {
                     self.persistent_state.log.truncate(index);
-                    self.persistent_state.log.push((term, entry));
+                    self.persistent_state.log.push(entry);
                 }
             }
 
@@ -674,7 +674,7 @@ impl Raft {
             // );
             self.apply_ch
                 .unbounded_send(ApplyMsg::Command {
-                    data: self.persistent_state.log[index].1.data.clone(),
+                    data: self.persistent_state.log[index].data.clone(),
                     index: index as u64,
                 })
                 .expect("Can't send");

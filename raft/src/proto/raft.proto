@@ -3,7 +3,8 @@ syntax = "proto3";
 package raftpb;
 
 message Entry {
-    bytes data = 1;
+    uint64 term = 1;
+    bytes data = 2;
 }
 
 // RequestVote RPC arguments structure.
