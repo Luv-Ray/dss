@@ -653,7 +653,7 @@ impl Raft {
                     if sum >= (self.peers.len() + 1) / 2 {
                         self.volatile_state.commit_index = success_index;
                         self.update_apply();
-                        self.send_heart_beat();
+                        // self.send_heart_beat();
                     }
                 }
             }
