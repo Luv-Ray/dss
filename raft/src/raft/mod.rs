@@ -76,12 +76,12 @@ enum RoleState {
     Follower,
 }
 
-#[derive(Debug)]
-struct PersistentState {
-    current_term: u64,
-    voted_for: Option<usize>,
-    log: Vec<Entry>,
-}
+// #[derive(Debug)]
+// struct PersistentState {
+//     current_term: u64,
+//     voted_for: Option<u64>,
+//     log: Vec<Entry>,
+// }
 
 impl PersistentState {
     pub fn new() -> Self {
@@ -168,12 +168,16 @@ impl Raft {
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
         // self.persister.save_raft_state(data);
+        let mut data = Vec::new();
+        labcodec::encode(&self.persistent_state, &mut data).unwrap();
+        self.persister.save_raft_state(data);
     }
 
     /// restore previously persisted state.
     fn restore(&mut self, data: &[u8]) {
         if data.is_empty() {
             // bootstrap without any state?
+            return;
         }
         // Your code here (2C).
         // Example:
@@ -186,6 +190,12 @@ impl Raft {
         //         panic!("{:?}", e);
         //     }
         // }
+        match labcodec::decode(data) {
+            Ok(state) => {
+                self.persistent_state = state;
+            }
+            Err(e) => panic!("{:?}", e),
+        }
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -303,7 +313,7 @@ impl Raft {
 
     fn trans_to_candidate(&mut self) {
         self.role_state = RoleState::Candidate { get_vote: 1 };
-        self.persistent_state.voted_for = Some(self.me);
+        self.persistent_state.voted_for = Some(self.me as u64);
     }
 
     fn trans_to_leader(&mut self) {
@@ -373,9 +383,11 @@ impl Raft {
             Event::Timeout => self.handle_timeout(),
             Event::HeartBeat => self.send_heart_beat(),
             Event::RequestVoteReply(from, request_vote_reply) => {
+                self.persist();
                 self.handle_request_vote_reply(from, request_vote_reply)
             }
             Event::AppendEntriesReply(log_len, from, append_entries_reply) => {
+                self.persist();
                 self.handle_append_entries_reply(log_len, from, append_entries_reply)
             }
         }
@@ -480,7 +492,7 @@ impl Raft {
             {
                 false
             } else {
-                self.persistent_state.voted_for = Some(candidate_id as usize);
+                self.persistent_state.voted_for = Some(candidate_id);
                 true
             }
         };
@@ -897,7 +909,9 @@ impl RaftService for Node {
         self.executor
             .spawn_with_handle(async move {
                 // debug!("vote: try lock");
-                let res = raft.lock().unwrap().handle_request_vote(args);
+                let mut raft = raft.lock().unwrap();
+                raft.persist();
+                let res = raft.handle_request_vote(args);
                 // debug!("vote: release lock");
                 res
             })
@@ -909,7 +923,9 @@ impl RaftService for Node {
         self.executor
             .spawn_with_handle(async move {
                 // debug!("append entries: try lock");
-                let res = raft.lock().unwrap().handle_append_entries(args);
+                let mut raft = raft.lock().unwrap();
+                raft.persist();
+                let res = raft.handle_append_entries(args);
                 // debug!("append entries: release lock");
                 res
             })
