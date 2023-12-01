@@ -237,6 +237,7 @@ impl Raft {
         M: labcodec::Message,
     {
         if !matches!(self.role_state, RoleState::Leader { .. }) {
+            // info!("Peer: {}, NotLeader", self.me);
             return Err(Error::NotLeader);
         }
 
@@ -245,7 +246,10 @@ impl Raft {
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         // Your code here (2B).
-        // println!("Receive command: {:?}", buf);
+        // info!(
+        //     "Peer: {}, Recive command: {:?}, index: {}",
+        //     self.me, &buf, index
+        // );
         self.persistent_state.log.push(Entry { term, data: buf });
 
         for (peer, clinet) in self.peers.iter().enumerate() {
@@ -336,9 +340,8 @@ impl Raft {
             Vec::new()
         } else {
             self.persistent_state.log[(index + 1)..]
-                .to_vec()
-                .into_iter()
-                // .map(|(_, entry)| entry)
+                .iter()
+                .cloned()
                 .collect()
         };
 
@@ -372,8 +375,8 @@ impl Raft {
             Event::RequestVoteReply(from, request_vote_reply) => {
                 self.handle_request_vote_reply(from, request_vote_reply)
             }
-            Event::AppendEntriesReply(len, from, append_entries_reply) => {
-                self.handle_append_entries_reply(len, from, append_entries_reply)
+            Event::AppendEntriesReply(log_len, from, append_entries_reply) => {
+                self.handle_append_entries_reply(log_len, from, append_entries_reply)
             }
         }
     }
@@ -425,12 +428,13 @@ impl Raft {
                     let args = self.append_entries_args(peer);
                     let fut = clinet.append_entries(&args);
                     let tx = self.event_loop_tx.clone().unwrap();
+                    let log_len = self.persistent_state.log.len();
 
                     self.executor
                         .spawn(async move {
                             if let Ok(append_entries_reply) = fut.await {
                                 tx.unbounded_send(Event::AppendEntriesReply(
-                                    args.entries.len(),
+                                    log_len,
                                     peer,
                                     append_entries_reply,
                                 ))
@@ -463,7 +467,7 @@ impl Raft {
             if term < self.persistent_state.current_term {
                 false
             }
-            // voted_for
+            // voted for
             else if self.persistent_state.voted_for.is_some()
                 && self.persistent_state.voted_for.unwrap() as u64 != candidate_id
             {
@@ -570,9 +574,10 @@ impl Raft {
             // update log
             for (index, entry) in entries.into_iter().enumerate() {
                 let index = prev_log_index + index + 1;
+
                 if index >= self.persistent_state.log.len() {
                     self.persistent_state.log.push(entry);
-                } else if self.persistent_state.log[index] != entry.clone() {
+                } else if self.persistent_state.log[index].term != entry.term {
                     self.persistent_state.log.truncate(index);
                     self.persistent_state.log.push(entry);
                 }
@@ -584,7 +589,7 @@ impl Raft {
                 self.update_apply();
             }
 
-            // TODO
+            // TODO: redirect(but how?)
             let _ = leader_id;
         }
 
@@ -597,7 +602,7 @@ impl Raft {
     // Leader: handle append entries reply
     fn handle_append_entries_reply(
         &mut self,
-        len: usize,
+        log_len: usize,
         from: usize,
         append_entries_reply: AppendEntriesReply,
     ) {
@@ -614,12 +619,15 @@ impl Raft {
                 next_index,
                 match_index,
             } => {
-                let success_index = next_index[from];
                 if next_index[from] < self.persistent_state.log.len() {
                     if success {
-                        next_index[from] = next_index[from].max(len);
-                        match_index[from] = success_index;
+                        next_index[from] = next_index[from].max(log_len);
+                        match_index[from] = match_index[from].max(log_len - 1);
                     } else {
+                        // info!(
+                        //     "Peer {} updata log fail on index {}",
+                        //     from, next_index[from]
+                        // );
                         next_index[from] -= 1;
                         let args = self.append_entries_args(from);
                         self.peers[from].append_entries(&args);
@@ -631,11 +639,8 @@ impl Raft {
 
         // commit
         match &self.role_state {
-            RoleState::Leader {
-                next_index,
-                match_index,
-            } => {
-                let success_index = next_index[from] - 1;
+            RoleState::Leader { match_index, .. } => {
+                let success_index = match_index[from];
                 if success
                     && term == self.persistent_state.current_term
                     && success_index > self.volatile_state.commit_index
@@ -651,7 +656,8 @@ impl Raft {
                     }
 
                     if sum >= (self.peers.len() + 1) / 2 {
-                        self.volatile_state.commit_index = success_index;
+                        self.volatile_state.commit_index =
+                            self.volatile_state.commit_index.max(success_index);
                         self.update_apply();
                         // self.send_heart_beat();
                     }
@@ -668,10 +674,7 @@ impl Raft {
         let end = self.volatile_state.commit_index;
 
         for index in begin..=end {
-            // println!(
-            //     "{}: Commit {} Data {:?}",
-            //     self.me, index, self.persistent_state.log[index].1.data
-            // );
+            // info!("{}: Commit {}", self.me, index);
             self.apply_ch
                 .unbounded_send(ApplyMsg::Command {
                     data: self.persistent_state.log[index].data.clone(),
@@ -688,16 +691,16 @@ impl Raft {
     /// Only for suppressing deadcode warnings.
     #[doc(hidden)]
     pub fn __suppress_deadcode(&mut self) {
-        let _ = self.start(&0);
+        // let _ = self.start(&0);
         let _ = self.cond_install_snapshot(0, 0, &[]);
         self.snapshot(0, &[]);
         let _ = self.send_request_vote(0, Default::default());
         self.persist();
         // let _ = &self.state;
-        let _ = &self.apply_ch;
-        let _ = &self.me;
+        // let _ = &self.apply_ch;
+        // let _ = &self.me;
         let _ = &self.persister;
-        let _ = &self.peers;
+        // let _ = &self.peers;
     }
 }
 
@@ -890,11 +893,27 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
-        let mut raft = self.raft.lock().unwrap();
-        raft.handle_request_vote(args)
+        let raft = self.raft.clone();
+        self.executor
+            .spawn_with_handle(async move {
+                // debug!("vote: try lock");
+                let res = raft.lock().unwrap().handle_request_vote(args);
+                // debug!("vote: release lock");
+                res
+            })
+            .unwrap()
+            .await
     }
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
-        let mut raft = self.raft.lock().unwrap();
-        raft.handle_append_entries(args)
+        let raft = self.raft.clone();
+        self.executor
+            .spawn_with_handle(async move {
+                // debug!("append entries: try lock");
+                let res = raft.lock().unwrap().handle_append_entries(args);
+                // debug!("append entries: release lock");
+                res
+            })
+            .unwrap()
+            .await
     }
 }
