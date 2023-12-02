@@ -44,7 +44,7 @@ enum Event {
     Timeout,
     HeartBeat,
     RequestVoteReply(usize, RequestVoteReply),
-    AppendEntriesReply(usize, usize, AppendEntriesReply),
+    AppendEntriesReply(u64, usize, AppendEntriesReply),
 }
 
 /// State of a raft peer.
@@ -88,7 +88,10 @@ impl PersistentState {
         PersistentState {
             current_term: 0,
             voted_for: None,
-            log: vec![Default::default()],
+            log: vec![Entry {
+                data: Vec::new(),
+                term: 0,
+            }],
         }
     }
 }
@@ -162,7 +165,7 @@ impl Raft {
     /// save Raft's persistent state to stable storage,
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
-    fn persist(&mut self) {
+    fn persist(&self) {
         // Your code here (2C).
         // Example:
         // labcodec::encode(&self.xxx, &mut data).unwrap();
@@ -193,6 +196,7 @@ impl Raft {
         match labcodec::decode(data) {
             Ok(state) => {
                 self.persistent_state = state;
+                self.persister.save_raft_state(data.to_vec());
             }
             Err(e) => panic!("{:?}", e),
         }
@@ -270,13 +274,15 @@ impl Raft {
             let args = self.append_entries_args(peer);
             let fut = clinet.append_entries(&args);
             let tx = self.event_loop_tx.clone().unwrap();
-            let log_len = self.persistent_state.log.len();
+            let last_term = self.persistent_state.current_term;
+            // let log_len = self.persistent_state.log.len();
 
             self.executor
                 .spawn(async move {
                     if let Ok(append_entries_reply) = fut.await {
                         tx.unbounded_send(Event::AppendEntriesReply(
-                            log_len,
+                            last_term,
+                            // log_len,
                             peer,
                             append_entries_reply,
                         ))
@@ -334,6 +340,7 @@ impl Raft {
 // args
 impl Raft {
     fn append_entries_args(&self, peer: usize) -> AppendEntriesArgs {
+        self.persist();
         // prev_log_index
         let index = {
             match &self.role_state {
@@ -349,15 +356,12 @@ impl Raft {
         let entries = if index + 1 >= self.persistent_state.log.len() {
             Vec::new()
         } else {
-            self.persistent_state.log[(index + 1)..]
-                .iter()
-                .cloned()
-                .collect()
+            self.persistent_state.log[(index + 1)..].to_vec()
         };
 
         AppendEntriesArgs {
             term: self.persistent_state.current_term,
-            leader_id: self.me as u64,
+            // leader_id: self.me as u64,
             prev_log_index: index as u64,
             prev_log_term,
             entries,
@@ -366,6 +370,7 @@ impl Raft {
     }
 
     fn request_vote_args(&self) -> RequestVoteArgs {
+        self.persist();
         RequestVoteArgs {
             term: self.persistent_state.current_term,
             candidate_id: self.me as u64,
@@ -383,12 +388,10 @@ impl Raft {
             Event::Timeout => self.handle_timeout(),
             Event::HeartBeat => self.send_heart_beat(),
             Event::RequestVoteReply(from, request_vote_reply) => {
-                self.persist();
                 self.handle_request_vote_reply(from, request_vote_reply)
             }
-            Event::AppendEntriesReply(log_len, from, append_entries_reply) => {
-                self.persist();
-                self.handle_append_entries_reply(log_len, from, append_entries_reply)
+            Event::AppendEntriesReply(last_term, from, append_entries_reply) => {
+                self.handle_append_entries_reply(last_term, from, append_entries_reply)
             }
         }
     }
@@ -429,34 +432,33 @@ impl Raft {
 
     // Leader: send heart beat
     fn send_heart_beat(&self) {
-        match &self.role_state {
-            RoleState::Leader { .. } => {
-                // println!("{}: Send Heart Beat", self.me);
-                for (peer, clinet) in self.peers.iter().enumerate() {
-                    if peer == self.me {
-                        continue;
-                    }
-
-                    let args = self.append_entries_args(peer);
-                    let fut = clinet.append_entries(&args);
-                    let tx = self.event_loop_tx.clone().unwrap();
-                    let log_len = self.persistent_state.log.len();
-
-                    self.executor
-                        .spawn(async move {
-                            if let Ok(append_entries_reply) = fut.await {
-                                tx.unbounded_send(Event::AppendEntriesReply(
-                                    log_len,
-                                    peer,
-                                    append_entries_reply,
-                                ))
-                                .expect("Can't send");
-                            }
-                        })
-                        .expect("Can't spawn");
+        if matches!(&self.role_state, RoleState::Leader { .. }) {
+            // println!("{}: Send Heart Beat", self.me);
+            for (peer, clinet) in self.peers.iter().enumerate() {
+                if peer == self.me {
+                    continue;
                 }
+
+                let args = self.append_entries_args(peer);
+                let fut = clinet.append_entries(&args);
+                let tx = self.event_loop_tx.clone().unwrap();
+                let last_term = self.persistent_state.current_term;
+                // let log_len = self.persistent_state.log.len();
+
+                self.executor
+                    .spawn(async move {
+                        if let Ok(append_entries_reply) = fut.await {
+                            tx.unbounded_send(Event::AppendEntriesReply(
+                                last_term,
+                                // log_len,
+                                peer,
+                                append_entries_reply,
+                            ))
+                            .expect("Can't send");
+                        }
+                    })
+                    .expect("Can't spawn");
             }
-            _ => {}
         }
     }
 
@@ -476,19 +478,14 @@ impl Raft {
 
         let vote_granted = {
             // term
-            if term < self.persistent_state.current_term {
-                false
-            }
-            // voted for
-            else if self.persistent_state.voted_for.is_some()
-                && self.persistent_state.voted_for.unwrap() as u64 != candidate_id
-            {
-                false
-            }
-            // log is up-to-date(section 5.4.1)
-            else if last_log_term < self.persistent_state.log.last().unwrap().term
-                || (last_log_term == self.persistent_state.log.last().unwrap().term
-                    && last_log_index < self.persistent_state.log.len() as u64)
+            if term < self.persistent_state.current_term
+                // voted for
+                || (self.persistent_state.voted_for.is_some()
+                    && self.persistent_state.voted_for.unwrap() != candidate_id)
+                // log is up-to-date(section 5.4.1)
+                || last_log_term < self.persistent_state.log.last().unwrap().term
+                    || (last_log_term == self.persistent_state.log.last().unwrap().term
+                        && last_log_index < self.persistent_state.log.len() as u64)
             {
                 false
             } else {
@@ -497,6 +494,7 @@ impl Raft {
             }
         };
 
+        self.persist();
         Ok(RequestVoteReply {
             term: self.persistent_state.current_term,
             vote_granted,
@@ -513,22 +511,19 @@ impl Raft {
             return;
         }
 
-        match &mut self.role_state {
-            RoleState::Candidate { get_vote } => {
-                if term > self.persistent_state.current_term {
-                    self.trans_term(term);
-                    self.trans_to_follower();
-                    return;
-                }
+        if let RoleState::Candidate { get_vote } = &mut self.role_state {
+            if term > self.persistent_state.current_term {
+                self.trans_term(term);
+                self.trans_to_follower();
+                return;
+            }
 
-                if vote_granted {
-                    *get_vote += 1;
-                    if *get_vote >= (self.peers.len() + 1) as u64 / 2 {
-                        self.trans_to_leader();
-                    }
+            if vote_granted {
+                *get_vote += 1;
+                if *get_vote >= (self.peers.len() + 1) as u64 / 2 {
+                    self.trans_to_leader();
                 }
             }
-            _ => {}
         }
     }
 
@@ -542,7 +537,7 @@ impl Raft {
 
         let AppendEntriesArgs {
             term,
-            leader_id,
+            // leader_id,
             prev_log_index,
             prev_log_term,
             entries,
@@ -568,21 +563,24 @@ impl Raft {
                 .expect("Can't send");
         }
 
-        let success = {
-            if term < self.persistent_state.current_term {
-                false
-            } else if self.persistent_state.log.len() <= prev_log_index
-                || self.persistent_state.log[prev_log_index].term != prev_log_term
-            {
-                false
-            } else {
-                true
-            }
-        };
+        // success: new last index
+        // fail: new next_index
+        let sync_index;
+        let success;
+        if term < self.persistent_state.current_term
+            || self.persistent_state.log.len() <= prev_log_index
+        {
+            sync_index = self.persistent_state.log.len();
+            success = false;
+        } else if self.persistent_state.log[prev_log_index].term != prev_log_term {
+            sync_index = prev_log_index;
+            success = false;
+        } else {
+            sync_index = prev_log_index + entries.len();
+            success = true;
+        }
 
         if success {
-            let sync_index = prev_log_index + entries.len();
-
             // update log
             for (index, entry) in entries.into_iter().enumerate() {
                 let index = prev_log_index + index + 1;
@@ -600,82 +598,90 @@ impl Raft {
                 self.volatile_state.commit_index = leader_commit.min(sync_index);
                 self.update_apply();
             }
-
-            // TODO: redirect(but how?)
-            let _ = leader_id;
         }
 
+        self.persist();
         Ok(AppendEntriesReply {
             term: self.persistent_state.current_term,
             success,
+            log_index: sync_index as u64,
         })
     }
 
     // Leader: handle append entries reply
     fn handle_append_entries_reply(
         &mut self,
-        log_len: usize,
+        last_term: u64,
         from: usize,
         append_entries_reply: AppendEntriesReply,
     ) {
-        let AppendEntriesReply { term, success } = append_entries_reply;
+        let AppendEntriesReply {
+            term,
+            success,
+            log_index,
+        } = append_entries_reply;
+        let log_index = log_index as usize;
 
         if term > self.persistent_state.current_term {
             self.trans_to_follower();
             return;
+        } else if term < self.persistent_state.current_term
+            || last_term < self.persistent_state.current_term
+        {
+            return;
         }
 
         // change next and match index
-        match &mut self.role_state {
-            RoleState::Leader {
-                next_index,
-                match_index,
-            } => {
-                if next_index[from] < self.persistent_state.log.len() {
-                    if success {
-                        next_index[from] = next_index[from].max(log_len);
-                        match_index[from] = match_index[from].max(log_len - 1);
-                    } else {
-                        // info!(
-                        //     "Peer {} updata log fail on index {}",
-                        //     from, next_index[from]
-                        // );
-                        next_index[from] -= 1;
-                        let args = self.append_entries_args(from);
-                        self.peers[from].append_entries(&args);
-                    }
+        if let RoleState::Leader {
+            next_index,
+            match_index,
+        } = &mut self.role_state
+        {
+            if next_index[from] < self.persistent_state.log.len() {
+                if success {
+                    next_index[from] = next_index[from].max(log_index + 1);
+                    match_index[from] = match_index[from].max(log_index);
+                } else {
+                    next_index[from] = next_index[from].min(log_index);
+                    // if next_index[from] > log_index {
+                    // } else {
+                    //     next_index[from] -= 1;
+                    //     if next_index[from] == 0 {
+                    //         info!(
+                    //             "Should not happen!!! term: {}, last_term: {}, cterm: {}",
+                    //             term, last_term, self.persistent_state.current_term
+                    //         );
+                    //     }
+                    // }
+                    let args = self.append_entries_args(from);
+                    self.peers[from].append_entries(&args);
                 }
             }
-            _ => {}
         }
 
         // commit
-        match &self.role_state {
-            RoleState::Leader { match_index, .. } => {
-                let success_index = match_index[from];
-                if success
-                    && term == self.persistent_state.current_term
-                    && success_index > self.volatile_state.commit_index
-                {
+        if let RoleState::Leader { match_index, .. } = &self.role_state {
+            let success_index = match_index[from];
+            if success {
+                for index in (self.volatile_state.commit_index + 1)..=success_index {
                     let mut sum = 1;
                     for i in 0..self.peers.len() {
                         if i == self.me {
                             continue;
                         }
-                        if match_index[i] >= success_index {
+                        if match_index[i] >= index {
                             sum += 1;
                         }
                     }
 
                     if sum >= (self.peers.len() + 1) / 2 {
-                        self.volatile_state.commit_index =
-                            self.volatile_state.commit_index.max(success_index);
-                        self.update_apply();
-                        // self.send_heart_beat();
+                        self.volatile_state.commit_index = index;
+                    } else {
+                        break;
                     }
                 }
+                self.update_apply();
             }
-            _ => {}
         }
     }
 }
@@ -695,7 +701,7 @@ impl Raft {
                 .expect("Can't send");
         }
 
-        self.volatile_state.last_applied = end;
+        self.volatile_state.last_applied = self.volatile_state.last_applied.max(end);
     }
 }
 
@@ -707,11 +713,11 @@ impl Raft {
         let _ = self.cond_install_snapshot(0, 0, &[]);
         self.snapshot(0, &[]);
         let _ = self.send_request_vote(0, Default::default());
-        self.persist();
+        // self.persist();
         // let _ = &self.state;
         // let _ = &self.apply_ch;
         // let _ = &self.me;
-        let _ = &self.persister;
+        // let _ = &self.persister;
         // let _ = &self.peers;
     }
 }
@@ -866,6 +872,7 @@ impl Node {
     pub fn kill(&self) {
         // Your code here, if desired.
         if let Some(sender) = self.shutdown_tx.lock().unwrap().take() {
+            // info!("Kill {}", self.raft.lock().unwrap().me);
             sender.send(()).unwrap();
         }
     }
@@ -910,7 +917,6 @@ impl RaftService for Node {
             .spawn_with_handle(async move {
                 // debug!("vote: try lock");
                 let mut raft = raft.lock().unwrap();
-                raft.persist();
                 let res = raft.handle_request_vote(args);
                 // debug!("vote: release lock");
                 res
@@ -924,7 +930,6 @@ impl RaftService for Node {
             .spawn_with_handle(async move {
                 // debug!("append entries: try lock");
                 let mut raft = raft.lock().unwrap();
-                raft.persist();
                 let res = raft.handle_append_entries(args);
                 // debug!("append entries: release lock");
                 res
